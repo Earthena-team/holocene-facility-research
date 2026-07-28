@@ -1,0 +1,131 @@
+# Facility Research — Cloud Build → Artifact Registry → Cloud Run
+#
+# Prerequisites:
+#   - Artifact Registry Docker repo ${_AR_REPO} in ${_REGION}
+#   - VPC connector ${_VPC_CONNECTOR} in ${_REGION} (for Memorystore Redis)
+#   - Secret Manager secrets (values you provide):
+#       REDIS_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+#       GEMINI_API_KEY, GOOGLE_MAPS_API_KEY
+#   - REDIS_URL = Memorystore private IP, e.g. redis://10.x.x.x:6379/0
+#     (never redis://localhost:... — that only works locally)
+#   - Cloud Run runtime SA: roles/secretmanager.secretAccessor on those secrets
+#   - Cloud Build SA: Artifact Registry writer, Cloud Run admin,
+#     iam.serviceAccountUser on the runtime SA
+#
+# Trigger example:
+#   gcloud builds submit --config=cloudbuild.yaml
+#
+# Image tags use $BUILD_ID (always set). $SHORT_SHA is empty on manual
+# submit unless you pass --substitutions=SHORT_SHA=$(git rev-parse --short HEAD).
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: facility-research
+  _VPC_CONNECTOR: cloudrun-connector
+  _REDIS_SECRET: REDIS_URL
+  _SUPABASE_URL_SECRET: SUPABASE_URL
+  _SUPABASE_SERVICE_KEY_SECRET: SUPABASE_SERVICE_ROLE_KEY
+  _GEMINI_API_KEY_SECRET: GEMINI_API_KEY
+  _GEOCODING_API_KEY_SECRET: GOOGLE_MAPS_API_KEY
+  _SUPABASE_SCHEMA: supply_res_dev
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-api:${BUILD_ID}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-api:latest
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-worker:${BUILD_ID}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-worker:latest
+
+steps:
+  # --- Build ---
+  - id: build-api
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.api
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-api:${BUILD_ID}
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-api:latest
+      - .
+
+  - id: build-worker
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.worker
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-worker:${BUILD_ID}
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-worker:latest
+      - .
+
+  # --- Push (also covered by `images:` above; explicit push keeps tags available for deploy) ---
+  - id: push-api
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-api
+    waitFor: [build-api]
+
+  - id: push-worker
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-worker
+    waitFor: [build-worker]
+
+  # --- Deploy API ---
+  - id: deploy-api
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - facility-research-api
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-api:${BUILD_ID}
+      - --region=${_REGION}
+      - --platform=managed
+      - --port=8000
+      - --cpu=1
+      - --memory=512Mi
+      - --concurrency=80
+      - --min-instances=0
+      - --max-instances=10
+      - --cpu-throttling
+      - --allow-unauthenticated
+      - --vpc-connector=${_VPC_CONNECTOR}
+      - --vpc-egress=private-ranges-only
+      - --set-env-vars=SUPABASE_SCHEMA=${_SUPABASE_SCHEMA}
+      - --set-secrets=REDIS_URL=${_REDIS_SECRET}:latest,SUPABASE_URL=${_SUPABASE_URL_SECRET}:latest,SUPABASE_SERVICE_KEY=${_SUPABASE_SERVICE_KEY_SECRET}:latest
+    waitFor: [push-api]
+
+  # --- Deploy worker ---
+  - id: deploy-worker
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - facility-research-worker
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/facility-research-worker:${BUILD_ID}
+      - --region=${_REGION}
+      - --platform=managed
+      - --port=8080
+      - --cpu=1
+      - --memory=512Mi
+      - --min-instances=1
+      - --max-instances=1
+      - --no-cpu-throttling
+      - --no-allow-unauthenticated
+      - --vpc-connector=${_VPC_CONNECTOR}
+      - --vpc-egress=private-ranges-only
+      - --set-env-vars=WORKER_HEALTH_PORT=8080,SUPABASE_SCHEMA=${_SUPABASE_SCHEMA}
+      - --set-secrets=REDIS_URL=${_REDIS_SECRET}:latest,SUPABASE_URL=${_SUPABASE_URL_SECRET}:latest,SUPABASE_SERVICE_KEY=${_SUPABASE_SERVICE_KEY_SECRET}:latest,GEMINI_API_KEY=${_GEMINI_API_KEY_SECRET}:latest,GEOCODING_API_KEY=${_GEOCODING_API_KEY_SECRET}:latest
+    waitFor: [push-worker]
