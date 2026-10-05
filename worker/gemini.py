@@ -34,11 +34,16 @@ SYSTEM_PROMPT = (
     "real, currently operating facility involved in producing that product for the supplier — "
     "including facilities the supplier owns directly AND third-party sites operating on its behalf "
     "(contract manufacturers, toll manufacturers, joint-venture plants, third-party logistics "
-    "providers, co-packers). Do not include the customer's own facilities, resellers, or pure "
-    "sales/admin offices with no production, storage, or processing role. "
-    "For each facility return: facility_name, full postal facility_address, latitude/longitude "
-    "if a source states them (else null — never guess coordinates), facility_type as exactly one of "
-    "manufacturing | logistics | raw_material, confidence (high/medium/low), and source_url. "
+    "providers, co-packers). Cover the full value chain: growing/extraction and primary processing "
+    "(plantations, estates, farms, mills, mines, quarries, wells) as well as refining, "
+    "manufacturing, and logistics — do not stop after refining hubs or a few branded plants. "
+    "Do not include the customer's own facilities, resellers, or pure sales/admin offices with no "
+    "production, storage, or processing role. "
+    "For each facility return: facility_name, facility_address (full postal address when available; "
+    "for farms/plantations/mills/mines a locality such as district, province, and country is enough "
+    "when no postal address exists), latitude/longitude if a source states them (else null — never "
+    "guess coordinates), facility_type as exactly one of manufacturing | logistics | raw_material, "
+    "confidence (high/medium/low), and source_url. "
     "Manufacturing = production/assembly/fabrication plants, contract or toll manufacturing sites. "
     "Logistics = warehouses, distribution centers, fulfillment hubs, ports, freight terminals. "
     "Raw_material = mines, quarries, wells, smelters, refineries, mills, tanneries, farms, "
@@ -49,6 +54,57 @@ SYSTEM_PROMPT = (
     "distinct real facilities as the evidence supports — do not stop after just one or two hits if "
     "more exist. If you cannot verify an address, set confidence low. Return JSON only."
 )
+
+# Origin-only cues: growing / extraction sites that satisfy upstream coverage.
+# Nurseries, mills, smelters, tanneries, kilns, crushers, and refineries do NOT
+# count — one processing/nursery hit must not suppress the farm/origin retry.
+_UPSTREAM_KEYWORDS: tuple[str, ...] = (
+    "farm",
+    "plantation",
+    "estate",
+    "grower",
+    "grove",
+    "ranch",
+    "cooperative",
+    "co-operative",
+    "smallholder",
+    "orchard",
+    "vineyard",
+    "mine",
+    "quarry",
+    "well",
+    "concession",
+)
+_REFINERY_ONLY_KEYWORDS: tuple[str, ...] = ("refinery", "refining")
+
+
+def _is_upstream_facility(facility: dict[str, Any]) -> bool:
+    """True if name/address signals a growing or extraction origin site.
+
+    Primary processing (mills, crushers, smelters, nurseries, etc.) does not
+    count — those must not suppress the origin-coverage retry.
+    """
+    text = " ".join(
+        str(facility.get(k) or "") for k in ("facility_name", "facility_address")
+    ).lower()
+    if not text.strip():
+        return False
+    if any(kw in text for kw in _UPSTREAM_KEYWORDS):
+        return True
+    # Refinery/refining alone is midstream, not origin upstream.
+    if any(kw in text for kw in _REFINERY_ONLY_KEYWORDS):
+        return False
+    return False
+
+
+def _has_upstream_sites(facilities: list[dict[str, Any]]) -> bool:
+    """True if any returned facility looks like a growing/extraction origin site.
+
+    facility_type == raw_material is not enough: refineries, mills, nurseries, and
+    other processing sites are often typed raw_material and must still trigger
+    the upstream (origin) coverage retry.
+    """
+    return any(_is_upstream_facility(f) for f in facilities)
 
 
 @dataclass
@@ -147,29 +203,54 @@ class GeminiClient:
         user_msg = f"Supplier: {supplier_name}\nProduct: {product}"
         result = await self._call(user_msg)
 
-        # Conditional retry (max 1): low yield on the first call. A different search
-        # angle — third-party/investigative sources instead of the company's own
-        # pages — tends to surface facilities the first pass missed.
-        if len(result.facilities_raw) < self.settings.min_facilities_before_retry:
+        # Conditional retry (max 1): low yield OR no upstream sites on the first
+        # call. Prefer the upstream search angle when upstream coverage is missing
+        # (including when both triggers apply); otherwise broaden third-party sources.
+        low_yield = len(result.facilities_raw) < self.settings.min_facilities_before_retry
+        missing_upstream = not _has_upstream_sites(result.facilities_raw)
+        if low_yield or missing_upstream:
+            reasons: list[str] = []
+            if low_yield:
+                reasons.append("low_yield")
+            if missing_upstream:
+                reasons.append("missing_upstream")
             logger.info(
-                "conditional retry for %s / %s (found=%s, searches=%s)",
+                "conditional retry for %s / %s (found=%s, searches=%s, reasons=%s)",
                 supplier_name,
                 product,
                 len(result.facilities_raw),
                 result.search_queries,
+                ",".join(reasons),
             )
             known = ", ".join(
                 f.get("facility_name", "") for f in result.facilities_raw if f.get("facility_name")
             ) or "none yet"
-            retry_msg = (
-                f"{user_msg}\n"
-                f"Facilities already found (do not repeat): {known}\n"
-                "The first pass may have missed facilities. Broaden the search: check contract/toll "
-                "manufacturer relationships, third-party logistics providers, published factory-audit "
-                "databases (OpenSupplyHub, Sourcemap, Better Work, Fair Labor Association), import/"
-                f'customs records, and local trade press for "{supplier_name}" facility locations. '
-                "Only return facilities not already found."
-            )
+            if missing_upstream:
+                retry_msg = (
+                    f"{user_msg}\n"
+                    f"Facilities already found (do not repeat): {known}\n"
+                    "The first pass may have missed origin growing/extraction sites. Search "
+                    "specifically for farms, plantations, estates, grower cooperatives, "
+                    "smallholder sourcing regions, and branded grower programs (e.g. Cocoa Life); "
+                    "also mines, quarries, wells, and concessions where relevant. Check origin-country "
+                    "sourcing disclosures, cooperative/farmer lists, RSPO / NDPE / concession maps, "
+                    f'named regional subsidiaries, and local agri/trade press for "{supplier_name}" '
+                    f"{product} locations. Do not re-list refining hubs, manufacturing plants, "
+                    "processing plants, or nurseries/tech centers already found. Locality-level "
+                    "locations (district, province, country) are acceptable when no postal address "
+                    "exists; coordinates only if a source states them. Only return facilities not "
+                    "already found."
+                )
+            else:
+                retry_msg = (
+                    f"{user_msg}\n"
+                    f"Facilities already found (do not repeat): {known}\n"
+                    "The first pass may have missed facilities. Broaden the search: check contract/toll "
+                    "manufacturer relationships, third-party logistics providers, published factory-audit "
+                    "databases (OpenSupplyHub, Sourcemap, Better Work, Fair Labor Association), import/"
+                    f'customs records, and local trade press for "{supplier_name}" facility locations. '
+                    "Only return facilities not already found."
+                )
             retry = await self._call(retry_msg)
             result.facilities_raw = result.facilities_raw + retry.facilities_raw
             result.input_tokens += retry.input_tokens
